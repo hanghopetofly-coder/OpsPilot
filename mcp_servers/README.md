@@ -1,134 +1,98 @@
 # MCP Servers
 
-为 AIOps 智能诊断提供日志查询和监控数据工具。
+本目录提供两个用于 AIOps 演示和离线测试的确定性 Mock MCP Server。它们不访问真实
+CLS、Prometheus 或云监控，也不能直接用于生产诊断。
 
-## 📚 服务列表
+## 服务与工具
 
-### CLS Server (`cls_server.py`)
-**日志查询服务** - 端口 8003
+### CLS Server
 
-**核心工具：**
-- `get_current_timestamp` - 获取当前时间戳
-- `get_topic_info_by_name` - 查询日志主题
-- `search_log` - 日志搜索
-- `search_service_logs` - 服务日志查询（支持级别筛选）
-- `analyze_log_pattern` - 日志模式分析
+- 地址：`http://127.0.0.1:8003/mcp`
+- 传输：`streamable-http`
+- 工具：
+  - `get_current_timestamp()`：返回固定参考时刻的 Unix 毫秒时间戳。
+  - `get_region_code_by_name(region_name)`：查询固定 Mock 地域映射。
+  - `get_topic_info_by_name(topic_name, region_code=None)`：按名称查询 Mock 日志主题。
+  - `search_topic_by_service_name(service_name, region_code=None, fuzzy=True)`：按服务查主题。
+  - `search_log(topic_id, start_time, end_time, query=None, limit=100,
+    service_name=None, scenario="normal")`：返回有界代表日志和重复错误聚合。
 
-### Monitor Server (`monitor_server.py`)
-**监控数据服务** - 端口 8004
+`search_log` 的时间参数是 Unix 毫秒；`limit` 必须为 1–100。无论重复次数多少，响应
+最多返回 12 条代表记录，并通过 `statistics.repeated_errors` 保留聚合计数。查询支持
+`level:ERROR`、`message:timeout` 或普通文本匹配。
 
-**核心工具：**
-- `query_cpu_metrics` - CPU 使用率查询
-- `query_memory_metrics` - 内存使用查询
-- `query_process_list` - 进程列表
-- `search_historical_tickets` - 历史工单查询
-- `get_service_info` / `list_all_services` - 服务信息
+### Monitor Server
 
-## 🚀 快速开始
+- 地址：`http://127.0.0.1:8004/mcp`
+- 传输：`streamable-http`
+- 工具：
+  - `query_cpu_metrics(service_name, start_time=None, end_time=None, interval="1m",
+    scenario="normal")`
+  - `query_memory_metrics(service_name, start_time=None, end_time=None, interval="1m",
+    scenario="normal")`
 
-### 安装依赖
+时间格式为 `YYYY-MM-DD HH:MM:SS`；`interval` 只接受正整数分钟或小时（如 `1m`、
+`5m`、`1h`），最大为 `24h`。单次响应最多 288 个点，包含统计值、异常区间、趋势和
+阈值判定。
+
+## 确定性场景
+
+两个 Server 共用 `scenarios.py`，不读取墙上时钟、不使用随机数。省略或留空
+`scenario` 时固定为 `normal`；支持：
+
+| 场景 | 主要信号 |
+| --- | --- |
+| `normal` | 正常指标和健康日志 |
+| `cpu_saturation` | CPU 升至饱和并出现 worker/队列错误 |
+| `memory_pressure` | 内存压力、OOM 和 GC 信号 |
+| `database_timeout` | 数据库查询超时与连接池耗尽 |
+| `downstream_timeout` | 下游服务超时与熔断 |
+| `conflicting_evidence` | 正常 CPU 指标与 CPU 饱和日志冲突 |
+| `tool_unavailable` | Monitor 返回可分类的连接失败；CLS 保持可用作为替代来源 |
+
+默认指标窗口固定为 `2026-02-14 10:00:00` 至 `2026-02-14 11:00:00`，而不是
+“当前一小时”。`get_current_timestamp()` 将 `2026-02-14 11:00:00 UTC` 作为固定
+参考时刻。调用方传入的合法窗口会被保留；起止相同的单点故障窗口采样场景峰值。
+
+## 启动
+
+先在项目根目录安装依赖，然后分别启动：
+
 ```bash
-pip install fastmcp
+uv sync
+uv run python mcp_servers/cls_server.py
+uv run python mcp_servers/monitor_server.py
 ```
 
-### 启动服务
+Linux/macOS 也可使用仓库现有 Makefile：
 
-**方式一：使用 Makefile（推荐）**
 ```bash
-make mcp-start   # 启动所有 MCP 服务
-make mcp-stop    # 停止所有 MCP 服务
-make mcp-status  # 查看服务状态
+make start-cls
+make start-monitor
+make status-mcp
+make stop-cls
+make stop-monitor
 ```
 
-**方式二：手动启动**
+`make start` / `make stop` 会连同 FastAPI 一起启动或停止所有服务。Windows 可在激活
+`.venv` 后直接运行上面的 Python 入口；Makefile 的进程管理命令依赖 Unix 工具。
+
+## 验证
+
+这些测试不会启动网络服务：
+
 ```bash
-python mcp_servers/cls_server.py
-python mcp_servers/monitor_server.py
+uv run pytest tests/scenarios
+uv run python -m evaluation.run
 ```
 
-## 💡 使用示例
+`tests/scenarios/` 校验时间与输出边界、重复性、场景信号和失败协议；
+`evaluation/` 在固定 Raw Tool Result 上复用生产 Evidence、Ranking 和 Report 逻辑。
 
-### AIOps 诊断场景
+## 生产接入注意
 
-```
-用户: data-sync-service 出现告警，请排查
+替换为真实数据源时，至少需要实现鉴权、租户隔离、请求超时、服务端分页/限流、敏感
+信息过滤、审计和稳定的错误分类，并保持当前有界输出契约。Mock 评测结果不能代表真实
+模型、网络、CLS/监控后端或 Milvus 的质量。
 
-Agent 自动执行:
-1. list_all_services() → 查看所有服务状态
-2. get_service_info("data-sync-service") → 获取服务详情
-3. query_cpu_metrics("data-sync-service") → CPU 趋势分析
-4. search_service_logs("data-sync-service", level="error") → 错误日志
-5. analyze_log_pattern("data-sync-service") → 日志模式分析
-6. search_historical_tickets(service_name="data-sync-service") → 历史工单
-7. 综合分析 → 生成诊断报告和修复建议
-```
-
-### 工具参数示例
-
-**查询 CPU 指标：**
-```python
-query_cpu_metrics(
-    service_name="data-sync-service",
-    start_time="2024-02-14 02:00:00",
-    interval="1m"
-)
-```
-
-**搜索错误日志：**
-```python
-search_service_logs(
-    service_name="data-sync-service",
-    log_level="error",
-    keyword="timeout",
-    limit=100
-)
-```
-
-**搜索历史工单：**
-```python
-search_historical_tickets(
-    service_name="data-sync-service",
-    issue_type="cpu",
-    limit=10
-)
-```
-
-## 🔧 高级配置
-
-### 接入真实 API
-
-当前返回模拟数据。接入真实 API 步骤：
-
-**腾讯云 CLS：**
-```bash
-# 安装 SDK
-pip install tencentcloud-sdk-python
-
-# 配置环境变量
-export TENCENTCLOUD_SECRET_ID="your-id"
-export TENCENTCLOUD_SECRET_KEY="your-key"
-
-# 在 cls_server.py 中集成
-from tencentcloud.cls.v20201016 import cls_client
-```
-
-**其他监控系统：**
-- Prometheus
-- Grafana
-- 云监控（腾讯云/阿里云/AWS）
-- 自建监控平台
-
-### 自定义 Mock 数据
-
-修改各 Server 文件中的数据生成逻辑，模拟实际场景。
-
-## 📚 参考资料
-
-- [FastMCP 文档](https://github.com/jlowin/fastmcp)
-- [MCP 协议](https://modelcontextprotocol.io/)
-- [LangGraph 文档](https://langchain-ai.github.io/langgraph/)
-- [主项目 README](../README.md)
-
----
-
-**注意**: 当前版本返回模拟数据，生产环境需配置真实 API。
+更多应用配置和 AIOps 数据流见[主项目 README](../README.md)。

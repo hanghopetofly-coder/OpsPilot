@@ -1193,6 +1193,7 @@ class SuperBizAgentApp {
             }
 
             let fullResponse = '';
+            let reportReceived = false;
 
             // 处理 SSE 流式响应
             const reader = response.body.getReader();
@@ -1264,12 +1265,13 @@ class SuperBizAgentApp {
                                             } else if (sseMessage.type === 'report') {
                                                 // 处理最终报告事件 - 流式输出
                                                 console.log('AI Ops 最终报告生成');
+                                                reportReceived = true;
                                                 const reportText = `\n\n## 🎯 诊断报告\n\n${sseMessage.report || ''}\n`;
                                                 fullResponse += reportText;
                                             } else if (sseMessage.type === 'complete') {
                                                 // 处理完成事件
                                                 console.log('AI Ops 诊断完成');
-                                                if (sseMessage.response) {
+                                                if (sseMessage.response && !reportReceived) {
                                                     fullResponse += `\n\n${sseMessage.response}`;
                                                 }
                                                 this.updateAIOpsMessage(loadingMessageElement, fullResponse, []);
@@ -1278,12 +1280,14 @@ class SuperBizAgentApp {
                                                 console.log('AI Ops 流完成，最终内容长度:', fullResponse.length);
                                                 this.updateAIOpsMessage(loadingMessageElement, fullResponse, []);
                                                 return true;
-                                            } else if (sseMessage.type === 'error') {
-                                                throw new Error(sseMessage.data || sseMessage.message || '智能运维分析失败');
-                                            }
-                                        } catch (e) {
-                                            if (e.message.includes('智能运维')) throw e;
-                                            console.log('[AI Ops SSE] 单个JSON解析失败:', jsonStr);
+                                             } else if (sseMessage.type === 'error') {
+                                                 const streamError = new Error(sseMessage.data || sseMessage.message || '智能运维分析失败');
+                                                 streamError.isAIOpsStreamError = true;
+                                                 throw streamError;
+                                             }
+                                         } catch (e) {
+                                             if (e.isAIOpsStreamError) throw e;
+                                             console.log('[AI Ops SSE] 单个JSON解析失败:', jsonStr);
                                         }
                                     }
                                     if (loadingMessageElement) {
@@ -1331,6 +1335,7 @@ class SuperBizAgentApp {
                                         } else if (sseMessage.type === 'report') {
                                             // 处理最终报告事件 - 这是关键！
                                             console.log('AI Ops 最终报告生成，流式输出中...');
+                                            reportReceived = true;
                                             const reportText = `\n\n## 🎯 诊断报告\n\n${sseMessage.report || ''}\n`;
                                             fullResponse += reportText;
                                             if (loadingMessageElement) {
@@ -1339,7 +1344,7 @@ class SuperBizAgentApp {
                                         } else if (sseMessage.type === 'complete') {
                                             // 处理完成事件
                                             console.log('AI Ops 诊断完成，最终内容长度:', fullResponse.length);
-                                            if (sseMessage.response) {
+                                            if (sseMessage.response && !reportReceived) {
                                                 fullResponse += `\n\n${sseMessage.response}`;
                                             }
                                             // 使用最终的完整内容更新消息
@@ -1349,18 +1354,20 @@ class SuperBizAgentApp {
                                             console.log('AI Ops 流完成，最终内容长度:', fullResponse.length);
                                             this.updateAIOpsMessage(loadingMessageElement, fullResponse, []);
                                             return;
-                                        } else if (sseMessage.type === 'error') {
-                                            throw new Error(sseMessage.data || sseMessage.message || '智能运维分析失败');
-                                        }
+                                         } else if (sseMessage.type === 'error') {
+                                             const streamError = new Error(sseMessage.data || sseMessage.message || '智能运维分析失败');
+                                             streamError.isAIOpsStreamError = true;
+                                             throw streamError;
+                                         }
                                     } else {
                                         fullResponse += rawData;
                                         if (loadingMessageElement) {
                                             this.updateAIOpsStreamContent(loadingMessageElement, fullResponse);
                                         }
                                     }
-                                } catch (e) {
-                                    if (e.message.includes('智能运维')) throw e;
-                                    // 非 JSON 格式，直接追加原始数据
+                                 } catch (e) {
+                                     if (e.isAIOpsStreamError) throw e;
+                                     // 非 JSON 格式，直接追加原始数据
                                     fullResponse += rawData;
                                     if (loadingMessageElement) {
                                         this.updateAIOpsStreamContent(loadingMessageElement, fullResponse);

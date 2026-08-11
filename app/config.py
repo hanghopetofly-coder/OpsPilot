@@ -3,7 +3,9 @@
 使用 Pydantic Settings 实现类型安全的配置管理
 """
 
-from typing import Dict, Any
+from typing import Any
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +29,7 @@ class Settings(BaseSettings):
     # DashScope 配置
     dashscope_api_key: str = ""  # 默认空字符串，实际使用需从环境变量加载
     dashscope_model: str = "qwen-max"
+    dashscope_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     dashscope_embedding_model: str = "text-embedding-v4"  # v4 支持多种维度（默认 1024）
 
     # Milvus 配置
@@ -48,13 +51,25 @@ class Settings(BaseSettings):
     mcp_cls_url: str = "http://localhost:8003/mcp"
     mcp_monitor_transport: str = "streamable-http"
     mcp_monitor_url: str = "http://localhost:8004/mcp"
+    mcp_tool_max_attempts: int = Field(default=2, ge=1, le=2)
+    mcp_tool_retry_delay_seconds: float = Field(default=0.5, ge=0.0)
 
     # Prometheus
     prometheus_base_url: str = "http://127.0.0.1:9090"
     prometheus_request_timeout: float = 10.0
 
+    # AIOps 诊断预算与上下文边界
+    aiops_max_steps: int = Field(default=8, gt=0)
+    aiops_max_replans: int = Field(default=2, ge=0)
+    aiops_max_tool_calls: int = Field(default=10, gt=0)
+    aiops_tool_timeout_seconds: float = Field(default=20.0, gt=0)
+    aiops_raw_result_max_chars: int = Field(default=12000, ge=256)
+    aiops_evidence_max_chars: int = Field(default=1200, ge=128)
+    aiops_knowledge_max_chars: int = Field(default=6000, ge=256)
+    aiops_tool_schema_max_chars: int = Field(default=12000, ge=256)
+
     @property
-    def mcp_servers(self) -> Dict[str, Dict[str, Any]]:
+    def mcp_servers(self) -> dict[str, dict[str, Any]]:
         """获取完整的 MCP 服务器配置"""
         return {
             "cls": {
@@ -64,7 +79,7 @@ class Settings(BaseSettings):
             "monitor": {
                 "transport": self.mcp_monitor_transport,
                 "url": self.mcp_monitor_url,
-            }
+            },
         }
 
 

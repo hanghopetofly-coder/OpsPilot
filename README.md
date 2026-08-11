@@ -19,8 +19,8 @@ Web 应用中：
 - 用户可以通过浏览器进行普通或 SSE 流式对话。
 - Agent 可以检索上传到 Milvus 的 Markdown/TXT 知识。
 - Agent 可以读取 Prometheus 当前告警。
-- AIOps 工作流会先规划、逐步调用工具、动态重规划，再输出 Markdown
-  诊断报告。
+- AIOps 工作流会生成候选假设，以结构化证据逐项验证、动态重规划，再输出
+  可追溯到 Evidence ID 的 Markdown 诊断报告。
 - MCP 客户端可以同时接入本地或托管的日志、监控工具服务。
 
 当前仓库适合作为本地演示、Agent 工作流验证和二次开发基础。内置 CLS 与
@@ -35,7 +35,7 @@ Monitor MCP Server 返回的是模拟数据；生产环境需要接入真实日�
 | RAG 检索 | DashScope Embedding + Milvus | 可用，需 API Key 和 Milvus |
 | 文档入库 | Markdown/TXT 分块、向量化、增量覆盖 | 可用，单文件最大 10 MB |
 | Prometheus 告警 | `/api/v1/alerts` HTTP API | 可用，需 Prometheus |
-| AIOps 诊断 | Planner → Executor → Replanner | 可用 |
+| AIOps 诊断 | Hypothesis → Evidence → Evaluation → Ranking | 可用，带预算和部分诊断 |
 | MCP 工具 | `streamable-http` / `sse` | 可用 |
 | CLS 日志工具 | 本地 FastMCP Server | 模拟数据 |
 | CPU/内存工具 | 本地 FastMCP Server | 模拟数据 |
@@ -52,7 +52,7 @@ flowchart LR
     F --> FILE["File API"]
 
     CHAT --> RA["RAG Agent"]
-    AIOPS --> WF["Plan → Execute → Replan"]
+    AIOPS --> WF["Evidence-Driven Diagnosis"]
     FILE --> SPLIT["文档分块"]
 
     RA --> QWEN["DashScope / 通义千问"]
@@ -94,24 +94,79 @@ flowchart LR
 4. 每个片段保留来源文件、扩展名、文件名和 Markdown 标题元数据。
 5. 重复上传同一路径的文件时，先删除旧来源片段，再写入新向量。
 
-### AIOps 诊断链路
+### AIOps Evidence-Driven Diagnosis
 
 ```mermaid
 flowchart TD
-    START["诊断请求"] --> PLAN["Planner：检索经验并制定计划"]
-    PLAN --> EXEC["Executor：执行首个步骤并调用工具"]
-    EXEC --> REPLAN{"Replanner：信息是否充分？"}
-    REPLAN -->|"继续"| EXEC
-    REPLAN -->|"调整计划"| EXEC
-    REPLAN -->|"生成响应"| REPORT["Markdown 诊断报告"]
-    REPORT --> END["SSE complete 事件"]
+    ALERT["Alert / 诊断请求"] --> HYP["Hypothesis / 候选假设"]
+    HYP --> PLAN["Plan / 绑定 hypothesis_id 的验证步骤"]
+    PLAN --> TOOL["Tool / 有界工具调用"]
+    TOOL --> RAW["Raw Tool Result / 有界原始结果"]
+    RAW --> EVIDENCE["Evidence / 确定性提取"]
+    EVIDENCE --> EVALUATION["Evaluation / 充分性、缺失与冲突"]
+    EVALUATION --> DECISION{"Execute / Replan / Finish"}
+    DECISION -->|"Execute：仍有步骤"| TOOL
+    DECISION -->|"Replan：缺失、冲突或可恢复失败"| REPLAN["Replan / 替代证据源"]
+    REPLAN --> PLAN
+    DECISION -->|"Finish：充分、预算耗尽或不可恢复"| RANK["Root Cause Ranking"]
+    RANK --> REPORT["Evidence-grounded Report"]
+    REPORT --> END["SSE complete"]
 ```
 
-- Planner 会先检索内部知识库，再结合本地和 MCP 工具生成执行步骤。
-- Executor 通过模型的 Tool Calling 选择并执行工具。
-- Replanner 可继续、替换剩余计划或直接生成最终响应。
-- 工作流最多执行 8 个步骤，避免无限重规划。
-- 诊断输出包括计划、步骤状态、最终报告和完成事件。
+工作流中的对象刻意分层，不能互相替代：
+
+| 对象 | 含义 | 不代表什么 |
+| --- | --- | --- |
+| Hypothesis | 待验证的候选原因，包含预期证据、状态和相对置信度 | 不是已经确认的根因 |
+| Plan | 一组结构化 `DiagnosisStep`；每步必须绑定 `hypothesis_id`，并声明验证目标、理由、工具提示和预期证据 | 不是工具输出，也不是结论 |
+| Raw Tool Result | 工具调用的一次有界、可序列化审计记录，包含参数、耗时、错误和截断状态 | 不是可直接引用的诊断证据 |
+| Evidence | 从 Raw Tool Result 确定性提取的简短观测，记录来源、关联假设、`supports` / `contradicts` 和 `raw_result_ref` | 只描述观测关系，不自动等同于根因 |
+| Root Cause | Evidence Evaluator 完成后按证据关系排序的候选；报告只引用 State 中存在的 Evidence ID | 排名第一也不自动表示已被线上事实确认 |
+
+关键约束与降级行为：
+
+- Planner 只做一次有界知识检索；未命中、错误或不可追踪的返回会按“无知识”继续。
+- 知识库片段会成为 `knowledge_base` Evidence，但默认不写入 `supports` 或
+  `contradicts`。它只能指导调查，不能证明当前线上事实，也不能单独确认根因。
+- Raw Tool Result 与 Evidence 都有字符/条数边界。后续重规划、排名和报告消费结构化
+  Evidence，不反复把原始大结果送入模型上下文。
+- Planner 或 Replanner 的结构化模型调用失败时会使用确定性结构化 fallback；初始
+  fallback 仍包含至少 3 个候选假设及其验证步骤，不退化为自由文本。
+- MCP 工具发现失败时保留本地工具；工具 timeout、连接错误或无效返回会被归类为
+  `ToolError`，优先重试或改用替代数据源。无法恢复或预算耗尽时仍会完成排名和
+  grounded report，并明确输出 partial diagnosis 与 `termination_reason`。
+- 三重预算共同保证有界终止：默认最多 8 个执行步骤、2 次重规划、10 次工具调用。
+  `remaining_budget` 随调用递减；任一硬预算耗尽都会进入 Finish，而不是继续循环。
+- MCP discovery 和工具执行受 `AIOPS_TOOL_TIMEOUT_SECONDS` 约束；单次 MCP 工具调用
+  最多 2 次总尝试（首次调用 + 至多 1 次重试），重试延迟由
+  `MCP_TOOL_RETRY_DELAY_SECONDS` 控制。
+- 每个请求生成独立 `diagnosis_id`，作为 LangGraph checkpoint thread 和 Planner、
+  Executor、Evidence、Ranking、Report 日志的关联键；客户端 `session_id` 只用于关联，
+  不会让不同诊断共享累加状态。
+
+#### 可复现的 downstream timeout 场景
+
+本地 Mock MCP 提供固定的 `downstream_timeout` 场景。相同场景和时间窗会生成确定性
+观测：checkout-service 的 CPU/内存保持正常，同时日志出现 payment-service timeout、
+circuit breaker open 和 fallback。`scenario` 仅用于本地演示和测试，不应作为生产输入。
+
+```bash
+curl -N -X POST "http://localhost:9900/api/aiops" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "demo-downstream-001",
+    "query": "诊断 checkout-service 最近 60 分钟延迟升高的根因",
+    "alert_context": {
+      "service": "checkout-service",
+      "window": "60m"
+    },
+    "scenario": "downstream_timeout"
+  }'
+```
+
+预期证据关系是：正常的本地资源观测反驳“资源饱和”，聚合后的下游超时和熔断日志
+支持“下游依赖超时”。最终报告中的具体 ID 以本次 SSE 返回的 `evidence` 事件为准，
+不会引用未进入 State 的证据。
 
 ## 技术栈
 
@@ -222,6 +277,18 @@ MCP_CLS_TRANSPORT=streamable-http
 MCP_CLS_URL=http://localhost:8003/mcp
 MCP_MONITOR_TRANSPORT=streamable-http
 MCP_MONITOR_URL=http://localhost:8004/mcp
+MCP_TOOL_MAX_ATTEMPTS=2
+MCP_TOOL_RETRY_DELAY_SECONDS=0.5
+
+# AIOps 预算与上下文边界
+AIOPS_MAX_STEPS=8
+AIOPS_MAX_REPLANS=2
+AIOPS_MAX_TOOL_CALLS=10
+AIOPS_TOOL_TIMEOUT_SECONDS=20
+AIOPS_RAW_RESULT_MAX_CHARS=12000
+AIOPS_EVIDENCE_MAX_CHARS=1200
+AIOPS_KNOWLEDGE_MAX_CHARS=6000
+AIOPS_TOOL_SCHEMA_MAX_CHARS=12000
 
 # Prometheus
 PROMETHEUS_BASE_URL=http://127.0.0.1:9090
@@ -251,8 +318,9 @@ uv run python mcp_servers/cls_server.py
 uv run python mcp_servers/monitor_server.py
 ```
 
-MCP 不可用时，普通对话 Agent 会退化为仅使用本地工具；AIOps
-Planner/Executor 当前会直接请求 MCP 工具列表，因此完整诊断建议启动两个服务。
+MCP 不可用时，普通对话 Agent 和 AIOps 都会保留本地工具继续运行。AIOps 会把
+discovery/调用失败记录为可追踪错误，并在证据不足时输出部分诊断；要复现完整的
+日志与指标调查链路，仍建议启动两个 Mock MCP 服务。
 
 ### 6. 启动主应用
 
@@ -354,7 +422,7 @@ Pydantic Settings 会读取根目录 `.env`，变量名大小写不敏感。
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `PORT` | `9900` | 监听端口 |
 | `DASHSCOPE_API_KEY` | 空 | 必填，模型和 Embedding 密钥 |
-| `DASHSCOPE_API_BASE` | DashScope 兼容地址 | ChatQwen 使用的兼容 API 地址 |
+| `DASHSCOPE_API_BASE` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | ChatQwen 使用的兼容 API 地址，由 `Settings` 读取并显式传入 |
 | `DASHSCOPE_MODEL` | `qwen-max` | 通用 Chat 模型 |
 | `DASHSCOPE_EMBEDDING_MODEL` | `text-embedding-v4` | Embedding 模型 |
 | `RAG_MODEL` | `qwen-max` | RAG 和 AIOps 使用的模型 |
@@ -368,8 +436,18 @@ Pydantic Settings 会读取根目录 `.env`，变量名大小写不敏感。
 | `MCP_CLS_URL` | `http://localhost:8003/mcp` | CLS MCP 地址 |
 | `MCP_MONITOR_TRANSPORT` | `streamable-http` | Monitor MCP 传输模式 |
 | `MCP_MONITOR_URL` | `http://localhost:8004/mcp` | Monitor MCP 地址 |
+| `MCP_TOOL_MAX_ATTEMPTS` | `2` | MCP 工具调用总尝试次数，配置范围 1–2 |
+| `MCP_TOOL_RETRY_DELAY_SECONDS` | `0.5` | MCP 重试基础延迟，秒；重试时指数退避 |
 | `PROMETHEUS_BASE_URL` | `http://127.0.0.1:9090` | Prometheus 地址 |
 | `PROMETHEUS_REQUEST_TIMEOUT` | `10.0` | Prometheus 请求超时，秒 |
+| `AIOPS_MAX_STEPS` | `8` | 单次诊断最多执行步骤数 |
+| `AIOPS_MAX_REPLANS` | `2` | 单次诊断最多重规划次数 |
+| `AIOPS_MAX_TOOL_CALLS` | `10` | 单次诊断最多工具调用次数 |
+| `AIOPS_TOOL_TIMEOUT_SECONDS` | `20.0` | 模型工具选择、MCP discovery 和每次工具尝试的超时，秒 |
+| `AIOPS_RAW_RESULT_MAX_CHARS` | `12000` | 单条 Raw Tool Result 的内容/载荷边界 |
+| `AIOPS_EVIDENCE_MAX_CHARS` | `1200` | 单条 Evidence observation 的字符边界 |
+| `AIOPS_KNOWLEDGE_MAX_CHARS` | `6000` | Planner 知识上下文总字符边界 |
+| `AIOPS_TOOL_SCHEMA_MAX_CHARS` | `12000` | 提供给规划模型的工具 Schema 总字符边界 |
 
 MCP 地址与传输模式需要匹配：
 
@@ -469,22 +547,63 @@ curl -X POST "http://localhost:9900/api/upload" \
 
 ### AIOps 诊断
 
-```bash
-curl -N -X POST "http://localhost:9900/api/aiops" \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"diagnosis-001"}'
+`POST /api/aiops` 接受 `session_id`、可选的 `query`、JSON `alert_context`，以及仅用于
+本地 Mock 的 `scenario`。响应为 SSE；浏览器原生 `EventSource` 只能发送 GET，因此
+POST 流应使用 `fetch` 和可读流消费：
+
+```javascript
+const response = await fetch("http://localhost:9900/api/aiops", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    session_id: "demo-downstream-001",
+    query: "诊断 checkout-service 最近 60 分钟延迟升高的根因",
+    alert_context: { service: "checkout-service", window: "60m" },
+    scenario: "downstream_timeout",
+  }),
+});
+
+if (!response.ok || !response.body) {
+  throw new Error(`AIOps request failed: ${response.status}`);
+}
+
+const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+let buffer = "";
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  buffer += value;
+  const frames = buffer.split(/\r?\n\r?\n/);
+  buffer = frames.pop() ?? "";
+  for (const frame of frames) {
+    const data = frame
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (data) console.log(JSON.parse(data));
+  }
+}
 ```
 
 主要 SSE 事件：
 
 | 类型 | 阶段 | 内容 |
 | --- | --- | --- |
-| `plan` | `plan_created` | 诊断步骤列表 |
-| `step_complete` | `step_executed` | 当前完成步骤和剩余数量 |
-| `status` | `replanner` 等 | 工作流状态 |
-| `report` | `final_report` | Markdown 报告 |
-| `complete` | `diagnosis_complete` | 最终诊断对象 |
+| `plan` | `planner` | 结构化 hypotheses 与 hypothesis-bound plan |
+| `step_complete` | `executor` | 当前执行记录与剩余步骤数 |
+| `evidence` | `evidence_extractor` | 当前 Evidence 数量与最近最多 10 条 Evidence |
+| `evaluation` | `evidence_evaluator` | 充分/缺失/冲突、工具失败、置信度与路由条件 |
+| `replan` | `replanner` | 替换步骤和 `replan_count`；仅在需要且仍有预算时出现 |
+| `status` | `termination` | 最终路由已进入有界终止阶段 |
+| `root_causes` | `root_cause_ranker` | 绑定 Evidence ID 的根因候选排序 |
+| `report` | `final_report` | 只从结构化 Evidence 生成的 Markdown 报告 |
+| `complete` | `diagnosis_complete` | `termination_reason`、相对置信度和预算计数 |
 | `error` | `error` / `exception` | 错误信息 |
+
+除 API 包装层的极早期异常外，节点事件与 `complete`/服务级 `error` 都带本次
+`diagnosis_id`。建议以它关联 SSE、应用日志和 checkpoint，而不是复用 `session_id`
+推断一次诊断的边界。
 
 ## Agent 工具
 
@@ -543,7 +662,17 @@ CLS、Prometheus、Grafana、云监控或内部可观测平台 API。
 OnCall-agent/
 ├── app/
 │   ├── agent/
-│   │   ├── aiops/                  # Planner、Executor、Replanner、状态
+│   │   ├── aiops/
+│   │   │   ├── models.py           # Hypothesis、Plan、Raw、Evidence、Error、Root Cause
+│   │   │   ├── state.py            # JSON-compatible LangGraph State
+│   │   │   ├── planner.py          # 有界知识检索与结构化初始计划
+│   │   │   ├── executor.py         # 工具执行、Raw Tool Result 与 ToolError
+│   │   │   ├── evidence.py         # 确定性证据提取与充分性评估
+│   │   │   ├── replanner.py        # 缺失/冲突/失败驱动的重规划
+│   │   │   ├── routing.py          # 纯函数预算与路由决策
+│   │   │   ├── reporting.py        # 根因排名、引用校验与 grounded report
+│   │   │   ├── prompts.py          # Planner/Replanner/Evaluator 提示规则
+│   │   │   └── utils.py            # 有界工具 Schema 与安全发现
 │   │   └── mcp_client.py           # 多 MCP 客户端、重试与错误展开
 │   ├── api/
 │   │   ├── aiops.py                # AIOps SSE API
@@ -570,7 +699,16 @@ OnCall-agent/
 ├── mcp_servers/
 │   ├── cls_server.py               # 模拟日志 MCP
 │   ├── monitor_server.py           # 模拟指标 MCP
+│   ├── scenarios.py                # 无随机/无 I/O 的可复现场景数据
 │   └── README.md
+├── evaluation/
+│   ├── cases.py                    # 20 个固定离线诊断用例
+│   ├── runner.py                   # 复用生产 Evidence/Ranking/Report 的指标聚合
+│   └── run.py                      # python -m evaluation.run 入口
+├── tests/
+│   ├── aiops/                      # Model、Evidence、路由、可靠性、SSE 与报告测试
+│   ├── evaluation/                 # 离线评测聚合与分母校验
+│   └── scenarios/                  # 确定性 MCP 场景和边界测试
 ├── static/
 │   ├── index.html
 │   ├── app.js
@@ -606,10 +744,11 @@ uv sync --extra dev
 常用检查：
 
 ```bash
-uv run ruff check app mcp_servers
-uv run black --check app mcp_servers
+uv run ruff check app mcp_servers evaluation tests
+uv run black --check app mcp_servers evaluation tests
 uv run mypy app --ignore-missing-imports
-uv run pytest
+uv run pytest tests
+uv run python -m evaluation.run
 uv run pre-commit run --all-files
 ```
 
@@ -623,15 +762,49 @@ make test
 make pre-commit
 ```
 
-当前仓库配置了 pytest、覆盖率、Ruff、Black、isort、mypy、Pyright、
-Bandit 和 pre-commit，但尚未包含 `tests/` 测试目录。新增功能时建议至少覆盖：
+当前仓库配置了 pytest、覆盖率、Ruff、Black、isort、mypy、Pyright、Bandit 和
+pre-commit，并已包含 `tests/aiops/`、`tests/evaluation/` 和 `tests/scenarios/`。现有离线测试覆盖结构化模型校验、Evidence
+提取/截断、充分/不足/冲突评估、有界路由终止、MCP timeout/连接失败/协议错误、
+Executor/Replanner fallback、服务图、SSE/API 契约，以及报告 Evidence ID 白名单校验。
+这些测试使用 mock dict，不调用网络、LLM 或真实 MCP Server。
 
-- 文档分块与重复索引
-- Prometheus 告警解析
-- MCP 失败降级与重试
-- SSE 事件格式
-- Planner/Executor/Replanner 路由
-- Milvus 连接失败与健康检查
+本次新增/修改的 Python 文件通过 Ruff 和 Black；全仓仍保留历史代码质量基线（109 个
+Ruff 问题、15 个 Black 未格式化文件），所以上述仓库级命令目前用于暴露遗留项，不能
+视为全绿门禁。应在独立改动中清理基线后再启用严格 CI。
+
+### 离线评测
+
+`evaluation/` 固定提供 20 个确定性用例，覆盖 CPU 饱和、内存压力、数据库超时、
+下游超时、正常、证据冲突和工具不可用。Runner 复用生产代码中的 Evidence
+Extractor、Evaluator、Root Cause Ranking 与 Report Grounding，并输出 Top-1、Top-3、
+平均工具调用/重规划/步骤、诊断成功率、工具失败恢复率和无证据结论数。
+
+```bash
+python -m evaluation.run
+python -m evaluation.run --json
+```
+
+本次提交在 Python 3.12 环境的实际输出如下。Top-1/Top-3 的分母是 14 个声明了
+预期根因的用例；正常、冲突和不可恢复工具失败用例按“不应确认根因”评估。工具失败
+恢复率为 3 个失败用例中成功改用替代证据源的 2 个：
+
+| 指标 | 结果 |
+| --- | ---: |
+| Cases | 20 |
+| Root Cause Top-1 Accuracy | 100.00% |
+| Root Cause Top-3 Recall | 100.00% |
+| Average Tool Calls | 2.05 |
+| Average Replans | 0.30 |
+| Average Steps | 2.05 |
+| Successful Diagnosis Rate | 100.00% |
+| Tool Failure Recovery Rate | 66.67% |
+| Unsupported Conclusion Count | 0 |
+
+**这些数据是可复现的模拟故障实验结果，不是生产环境数据。** 高分只说明固定案例与
+当前确定性 Evidence 规则保持一致，不代表真实告警分布、模型规划质量或生产准确率。
+
+离线评测消费固定的 Raw Tool Result，不启动 Qwen、MCP 或 Milvus。它适合验证证据
+关系、路由和报告回归，但不能替代真实依赖的端到端评测。
 
 ## 生产化注意事项
 
@@ -648,19 +821,23 @@ Bandit 和 pre-commit，但尚未包含 `tests/` 测试目录。新增功能时�
    `http://localhost:9900/api` 改为相对路径或环境化配置。
 9. 固定并定期升级前端 CDN 资源，生产环境建议自托管并设置 CSP。
 10. 为 Milvus Collection 变更设计备份、版本和迁移机制。
-11. 增加超时、并发控制、全链路追踪和指标。
+11. 按真实数据源细化超时与并发策略，并接入全链路追踪和运行指标。
 12. 使用 Secrets Manager、Kubernetes Secret 或 CI/CD Secret 管理密钥。
 
 ## 已知限制
 
-- CLS 和 Monitor MCP Server 当前只提供模拟数据。
-- 服务端会话只保存在内存中，重启后丢失。
+- LangGraph 当前使用 `MemorySaver`；会话和诊断 checkpoint 只存在于当前进程，重启后
+  丢失，也不支持多实例共享。
+- CLS 和 Monitor MCP Server 当前只提供确定性 Mock 数据，用于演示/测试而非生产
+  观测；生产接入前必须替换数据源、鉴权、租户隔离和审计。
+- 离线评测只覆盖固定 Raw Tool Result 上的确定性 Evidence/Ranking/Report 链路；真实
+  Qwen 推理、MCP 网络/服务端行为和 Milvus 检索质量尚未被该评测覆盖。
 - 前端会话保存在浏览器本地，不支持跨设备同步。
 - 前端 API 基础地址写死为 `localhost:9900`。
 - 应用启动依赖 Milvus 与有效 DashScope API Key，缺少时无法以降级模式启动。
 - 上传接口在索引失败时仍可能返回上传成功，需要结合日志判断入库状态。
 - 目录索引接口可接收服务端路径，不应在未鉴权公网环境开放。
-- 暂无自动化测试与 CI 工作流。
+- 仓库已有自动化测试，但尚无 CI 工作流；合并前需在本地运行测试与离线评测。
 - 暂无用户、租户、权限和配额模型。
 - 暂无独立数据库迁移或向量数据备份流程。
 
@@ -737,7 +914,7 @@ taskkill /F /PID <PID>
 - 接入真实 CLS、Prometheus Query API、Alertmanager 和工单系统。
 - 为诊断证据建立统一结构化 Schema 和可追溯引用。
 - 增加 Redis/PostgreSQL Checkpointer 与多租户会话。
-- 增加 Agent 评测集、离线回归和工具调用成功率指标。
+- 扩展离线评测基线，并增加真实 Qwen、MCP 与 Milvus 的隔离式端到端评测。
 - 增加 Dockerfile、生产 Compose、Kubernetes/Helm 部署。
 - 引入 OpenTelemetry，对模型、检索、MCP 和工作流做链路追踪。
 - 增加人机协同审批，避免 Agent 直接执行高风险变更。
