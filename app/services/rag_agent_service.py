@@ -29,7 +29,7 @@ from app.agent.mcp_client import (
 )
 
 # 阿里千问大模型和langchain集成参考： https://docs.langchain.com/oss/python/integrations/chat/qwen
-# 注意：需要配置环境变量 DASHSCOPE_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1 否则默认访问的是新加坡站点
+# ChatQwen 的 API 地址由 Settings 统一提供；默认使用中国站，可通过 DASHSCOPE_API_BASE 覆盖。
 # 同时也需要配置环境变量 DASHSCOPE_API_KEY=your_api_key
 
 
@@ -95,6 +95,7 @@ class RagAgentService:
         self.model = ChatQwen(
             model=self.model_name,
             api_key=config.dashscope_api_key,
+            base_url=config.dashscope_api_base,
             temperature=0.7,
             streaming=streaming,
         )

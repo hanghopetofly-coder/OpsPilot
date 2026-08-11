@@ -1,24 +1,46 @@
+"""Serializable LangGraph state for evidence-grounded diagnosis.
+
+State values intentionally remain JSON-compatible dictionaries and lists.
+Pydantic models from :mod:`app.agent.aiops.models` are used at node boundaries,
+then dumped with ``mode="json"`` before they are stored here.  No field uses a
+reducer: nodes return complete replacements for the lists they update, which
+keeps retries and checkpoint replay idempotent.
 """
-通用 Plan-Execute-Replan 状态定义
-基于 LangGraph 官方教程实现
-"""
 
-from typing import List, TypedDict, Annotated
-import operator
+from __future__ import annotations
+
+from typing import Any, TypedDict
 
 
-class PlanExecuteState(TypedDict):
-    """Plan-Execute-Replan 状态"""
-    
-    # 用户输入（任务描述）
+class PlanExecuteState(TypedDict, total=False):
+    """Minimal state shared by Planner, Executor, Evaluator and Replanner."""
+
+    # Correlation and request context.
+    diagnosis_id: str
+    session_id: str
     input: str
-    
-    # 执行计划（步骤列表）
-    plan: List[str]
-    
-    # 已执行的步骤历史
-    # 使用 operator.add 实现追加式更新（而非覆盖）
-    past_steps: Annotated[List[tuple], operator.add]
-    
-    # 最终响应/报告
+    alert_context: dict[str, Any]
+    scenario: str | None
+
+    # Explicit knowledge, hypotheses and remaining structured plan.
+    retrieved_knowledge: list[dict[str, Any]]
+    hypotheses: list[dict[str, Any]]
+    plan: list[dict[str, Any]]
+
+    # Execution data is deliberately split by abstraction level.
+    execution_history: list[dict[str, Any]]
+    raw_tool_results: list[dict[str, Any]]
+    evidence: list[dict[str, Any]]
+    tool_errors: list[dict[str, Any]]
+
+    # Small, deterministic loop budget.
+    replan_count: int
+    tool_call_count: int
+    step_count: int
+    remaining_budget: int
+
+    # Evaluation, ranked conclusions and terminal output.
+    evaluation: dict[str, Any] | None
+    root_causes: list[dict[str, Any]]
     response: str
+    termination_reason: str | None

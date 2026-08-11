@@ -1,159 +1,367 @@
-"""
-Planner 节点：制定执行计划
-基于 LangGraph 官方教程实现
-"""
+"""Hypothesis-driven Planner node for evidence-grounded AIOps diagnosis."""
 
-from textwrap import dedent
-from typing import Dict, Any, List
-from langchain_core.prompts import ChatPromptTemplate
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any, cast
+
+from langchain_core.documents import Document
 from langchain_qwq import ChatQwen
-from pydantic import BaseModel, Field
 from loguru import logger
+from pydantic import SecretStr
 
 from app.config import config
-from app.tools import DEFAULT_LOCAL_AGENT_TOOLS, retrieve_knowledge
-from app.agent.mcp_client import get_mcp_client_with_retry
-from .state import PlanExecuteState
-from .utils import format_tools_description
+from app.tools import retrieve_knowledge
 
-
-class Plan(BaseModel):
-    """计划的输出格式"""
-    steps: List[str] = Field(
-        description="完成任务所需的不同步骤。这些步骤应该按顺序执行，每一步都建立在前一步的基础上。"
-    )
-
-
-# Planner 提示词
-planner_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            dedent("""
-                作为一个专家级别的规划者，你需要将复杂的任务分解为可执行的步骤。
-
-                可用工具列表（用于制定计划时参考）：
-
-                {tools_description}
-
-                注意：你的职责是制定计划，实际的工具调用由 Executor 负责执行。
-
-                {experience_context}
-
-                对于给定的任务，请创建一个简单的、逐步的计划来完成它。计划应该：
-                - 将任务分解为逻辑上独立的步骤
-                - 每个步骤应该明确使用哪些工具(如果需要工具的话)来获取信息, 最好能同时提供工具执行所需要的参数
-                - 步骤之间应该有清晰的依赖关系
-                - 步骤描述要具体、可操作
-                - **如果有相关经验文档，请参考其中的方法和步骤制定计划**
-
-                示例输入："分析当前系统的性能问题"
-                示例输出（假设有对应工具）：
-                步骤1: 使用 get_metrics 工具收集系统的 CPU 和内存使用情况
-                步骤2: 使用 query_logs 工具检查最近的错误日志
-                步骤3: 使用 query_database 工具分析慢查询日志
-                步骤4: 综合以上信息生成性能分析报告
-            """).strip(),
-        ),
-        ("placeholder", "{messages}"),
-    ]
+from .models import (
+    DiagnosisEvidence,
+    DiagnosisHypothesis,
+    DiagnosisPlan,
+    DiagnosisStep,
 )
+from .prompts import PLANNER_PROMPT
+from .state import PlanExecuteState
+from .utils import format_tools_description, load_available_tools
+
+MAX_RETRIEVAL_QUERY_CHARS = 4_000
+MAX_DIAGNOSIS_REQUEST_CHARS = 12_000
+MAX_KNOWLEDGE_ITEMS = 5
+MAX_KNOWLEDGE_ITEM_CHARS = 1_200
+MAX_KNOWLEDGE_TOTAL_CHARS = 5_000
+MAX_KNOWLEDGE_CONTEXT_CHARS = 6_000
+MAX_KNOWLEDGE_EVIDENCE_CHARS = 700
+
+_NO_KNOWLEDGE_MESSAGES = ("没有找到相关信息", "未检索到相关")
+_KNOWLEDGE_ERROR_MESSAGES = ("检索知识时发生错误", "知识检索工具调用失败")
 
 
-async def planner(state: PlanExecuteState) -> Dict[str, Any]:
-    """
-    规划节点：根据用户输入生成执行计划
+def _truncate(value: str, limit: int) -> tuple[str, bool]:
+    """Return bounded text and whether truncation occurred."""
+    value = value.strip()
+    if limit <= 0:
+        return "", bool(value)
+    if len(value) <= limit:
+        return value, False
+    marker = "…[truncated]"
+    if limit <= len(marker):
+        return marker[:limit], True
+    return f"{value[: limit - len(marker)]}{marker}", True
 
-    流程：
-    1. 先查询内部文档，获取相关经验和最佳实践
-    2. 基于经验文档和可用工具制定执行计划
-    """
-    logger.info("=== Planner：制定执行计划 ===")
 
-    input_text = state.get("input", "")
-    logger.info(f"用户输入: {input_text}")
+def _message_text(result: Any) -> str:
+    """Extract a readable content string from a direct tool result/ToolMessage."""
+    content = getattr(result, "content", result)
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _safe_metadata(document: Document) -> dict[str, Any]:
+    """Keep only small, useful and JSON-compatible knowledge metadata."""
+    metadata = document.metadata or {}
+    allowed_keys = ("_source", "_file_name", "_extension", "h1", "h2", "h3")
+    safe: dict[str, Any] = {}
+    for key in allowed_keys:
+        value = metadata.get(key)
+        if value is not None:
+            safe[key] = str(value)
+    return safe
+
+
+def _documents_to_knowledge(documents: list[Document]) -> list[dict[str, Any]]:
+    """Convert LangChain documents into bounded, serializable state records."""
+    requested_top_k = max(1, int(config.rag_top_k))
+    item_limit = min(requested_top_k, MAX_KNOWLEDGE_ITEMS)
+    remaining_chars = min(MAX_KNOWLEDGE_TOTAL_CHARS, config.aiops_knowledge_max_chars)
+    records: list[dict[str, Any]] = []
+
+    for index, document in enumerate(documents[:item_limit], 1):
+        if remaining_chars <= 0:
+            break
+
+        item_chars = min(MAX_KNOWLEDGE_ITEM_CHARS, remaining_chars)
+        content, truncated = _truncate(str(document.page_content), item_chars)
+        if not content:
+            continue
+
+        metadata = _safe_metadata(document)
+        headers = [str(metadata[key]) for key in ("h1", "h2", "h3") if metadata.get(key)]
+        source = str(metadata.get("_file_name") or metadata.get("_source") or "unknown_source")
+        document_id = getattr(document, "id", None)
+        records.append(
+            {
+                "id": f"K{index:02d}",
+                "document_id": str(document_id) if document_id else None,
+                "source": source,
+                "title": " > ".join(headers) if headers else None,
+                "content": content,
+                "metadata": metadata,
+                "truncated": truncated,
+            }
+        )
+        remaining_chars -= len(content)
+
+    return records
+
+
+async def _retrieve_bounded_knowledge(query: str) -> list[dict[str, Any]]:
+    """Retrieve knowledge once; never turn misses or failures into knowledge."""
+    retrieval_query, _ = _truncate(query, MAX_RETRIEVAL_QUERY_CHARS)
+    if not retrieval_query:
+        return []
 
     try:
-        # 步骤1: 查询内部文档获取相关经验
-        logger.info("查询内部文档，寻找相关经验...")
-        experience_docs = ""
-        try:
-            # retrieve_knowledge 使用 response_format="content_and_artifact"
-            # ainvoke() 只返回 content（字符串），不是元组
-            context_str = await retrieve_knowledge.ainvoke({"query": input_text})
-            if context_str and context_str.strip():
-                experience_docs = context_str
-                logger.info(f"找到相关经验文档，长度: {len(experience_docs)}")
-            else:
-                logger.info("未找到相关经验文档")
-        except Exception as e:
-            logger.warning(f"查询内部文档失败: {e}")
+        # Supplying a ToolCall asks BaseTool to preserve the artifact in ToolMessage.
+        result = await asyncio.wait_for(
+            retrieve_knowledge.ainvoke(
+                {
+                    "type": "tool_call",
+                    "id": "planner_knowledge_retrieval",
+                    "name": retrieve_knowledge.name,
+                    "args": {"query": retrieval_query},
+                }
+            ),
+            timeout=config.aiops_tool_timeout_seconds,
+        )
+    except Exception as exc:
+        logger.warning("Planner 知识检索失败，按无知识继续: {}: {}", type(exc).__name__, exc)
+        return []
 
-        # 步骤2: 获取可用工具列表
-        # 获取本地工具
-        local_tools = list(DEFAULT_LOCAL_AGENT_TOOLS)
+    content = _message_text(result).strip()
+    artifact = getattr(result, "artifact", None)
+    documents = [item for item in artifact or [] if isinstance(item, Document)]
 
-        # 获取 MCP 工具
-        mcp_client = await get_mcp_client_with_retry()
-        mcp_tools = await mcp_client.get_tools()
+    if documents:
+        knowledge = _documents_to_knowledge(documents)
+        logger.info("Planner 检索到 {} 条有界知识记录", len(knowledge))
+        return knowledge
 
-        # 合并所有工具
-        all_tools = local_tools + mcp_tools
-        logger.info(f"可用工具数量: 本地 {len(local_tools)} + MCP {len(mcp_tools)}")
+    if not content or any(marker in content for marker in _NO_KNOWLEDGE_MESSAGES):
+        logger.info("Planner 未检索到相关知识，按无知识继续")
+        return []
+    if any(marker in content for marker in _KNOWLEDGE_ERROR_MESSAGES):
+        logger.warning("Planner 知识检索返回错误内容，已丢弃")
+        return []
 
-        # 格式化工具描述
-        tools_description = format_tools_description(all_tools)
+    # 无 artifact 时无法区分真实文档、框架错误和工具状态文本；宁可缺失知识，
+    # 也不把不可追踪的字符串升级为 Knowledge Evidence。
+    logger.warning("Planner 知识工具未返回可追踪 artifact，已按无知识处理")
+    return []
 
-        # 步骤3: 格式化经验文档上下文
-        if experience_docs:
-            experience_context = dedent(f"""
-                ## 相关经验文档
 
-                以下是从知识库中检索到的相关经验和最佳实践，请参考这些经验制定执行计划：
+def _render_knowledge_context(knowledge: list[dict[str, Any]]) -> str:
+    """Render bounded JSON for the Planner prompt."""
+    if not knowledge:
+        return "（没有可用的相关内部知识。未命中或检索错误不构成知识证据。）"
+    rendered = json.dumps(knowledge, ensure_ascii=False, default=str)
+    bounded, _ = _truncate(
+        rendered,
+        min(MAX_KNOWLEDGE_CONTEXT_CHARS, config.aiops_knowledge_max_chars),
+    )
+    return bounded
 
-                {experience_docs}
 
-                ---
-            """).strip()
-        else:
-            experience_context = ""
+def _preferred_tools(available_names: set[str], *candidates: str) -> list[str]:
+    selected = [name for name in candidates if name in available_names]
+    if selected:
+        return selected[:2]
+    if "query_prometheus_alerts" in available_names:
+        return ["query_prometheus_alerts"]
+    return [sorted(available_names)[0]] if available_names else []
 
-        # 步骤4: 创建 LLM 并生成计划
+
+def _fallback_plan(available_tool_names: set[str]) -> DiagnosisPlan:
+    """Create a validated three-hypothesis plan without free-form string steps."""
+    hypotheses = [
+        DiagnosisHypothesis(
+            id="H1",
+            cause="资源饱和或容量不足",
+            description="CPU、内存或其他关键资源可能持续处于异常水位。",
+            expected_evidence=[
+                "运行时指标显示资源持续超过告警阈值",
+                "同时间窗内存在与资源压力一致的告警或日志",
+            ],
+        ),
+        DiagnosisHypothesis(
+            id="H2",
+            cause="应用错误或近期变更导致性能回退",
+            description="应用异常、配置或部署变更可能引入错误与延迟。",
+            expected_evidence=[
+                "故障时间窗内出现聚合后的应用错误日志",
+                "错误率或告警与变更时间相关",
+            ],
+        ),
+        DiagnosisHypothesis(
+            id="H3",
+            cause="下游依赖超时或不可用",
+            description="外部服务、数据库或网络依赖可能造成级联故障。",
+            expected_evidence=[
+                "本地资源正常但存在明确的下游超时日志",
+                "依赖相关告警或调用失败与症状时间一致",
+            ],
+        ),
+    ]
+    steps = [
+        DiagnosisStep(
+            id="S1",
+            hypothesis_id="H1",
+            goal="验证关键资源是否在故障时间窗内持续饱和",
+            rationale="资源指标与告警可以直接支持或反驳资源饱和假设。",
+            tool_hint=_preferred_tools(
+                available_tool_names,
+                "query_cpu_metrics",
+                "query_memory_metrics",
+                "query_prometheus_alerts",
+            ),
+            expected_evidence=["CPU、内存的最大值、平均值、异常区间及关联告警"],
+        ),
+        DiagnosisStep(
+            id="S2",
+            hypothesis_id="H2",
+            goal="验证应用错误或变更是否与故障时间一致",
+            rationale="按服务和时间窗聚合错误日志可区分应用回退与资源问题。",
+            tool_hint=_preferred_tools(
+                available_tool_names,
+                "search_log",
+                "search_topic_by_service_name",
+                "query_prometheus_alerts",
+            ),
+            expected_evidence=["错误模式、出现次数、首末时间及与告警的关联"],
+        ),
+        DiagnosisStep(
+            id="S3",
+            hypothesis_id="H3",
+            goal="验证下游依赖是否出现超时或不可用",
+            rationale="依赖超时日志与本地资源指标可支持或反驳下游故障假设。",
+            tool_hint=_preferred_tools(
+                available_tool_names,
+                "search_log",
+                "query_cpu_metrics",
+                "query_memory_metrics",
+                "query_prometheus_alerts",
+            ),
+            expected_evidence=["下游目标、超时错误聚合、本地资源水位及时间相关性"],
+        ),
+    ]
+    return DiagnosisPlan(hypotheses=hypotheses, steps=steps)
+
+
+def _validate_and_bound_plan(result: Any, available_tool_names: set[str]) -> DiagnosisPlan:
+    """Validate cross references and remove hallucinated tool hints."""
+    plan = result if isinstance(result, DiagnosisPlan) else DiagnosisPlan.model_validate(result)
+    if not 3 <= len(plan.hypotheses) <= 5:
+        raise ValueError("Planner must return between 3 and 5 hypotheses")
+
+    payload = plan.model_dump(mode="json")
+    covered_hypotheses: set[str] = set()
+    for step in payload["steps"]:
+        valid_hints = [name for name in step["tool_hint"] if name in available_tool_names]
+        if available_tool_names and not valid_hints:
+            raise ValueError(f"step {step['id']} has no available tool hint")
+        step["tool_hint"] = valid_hints
+        covered_hypotheses.add(step["hypothesis_id"])
+
+    hypothesis_ids = {item["id"] for item in payload["hypotheses"]}
+    if missing := hypothesis_ids - covered_hypotheses:
+        raise ValueError(f"hypotheses without investigation steps: {sorted(missing)}")
+    return cast(DiagnosisPlan, DiagnosisPlan.model_validate(payload))
+
+
+def _knowledge_evidence(
+    knowledge: list[dict[str, Any]],
+    hypothesis_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Represent knowledge as guidance evidence, never as online proof."""
+    evidence: list[dict[str, Any]] = []
+    for index, item in enumerate(knowledge, 1):
+        excerpt, _ = _truncate(str(item["content"]), MAX_KNOWLEDGE_EVIDENCE_CHARS)
+        source = str(item.get("source") or "unknown_source")
+        record = DiagnosisEvidence(
+            id=f"KE{index:02d}",
+            source="knowledge_base",
+            tool_name=retrieve_knowledge.name,
+            hypothesis_ids=hypothesis_ids,
+            observation=(
+                f"内部知识（来源: {source}）提供以下调查指导，但不证明当前线上事实：" f"{excerpt}"
+            ),
+            supports=[],
+            contradicts=[],
+            reliability=None,
+            # Planner retrieval is represented directly in ``retrieved_knowledge``;
+            # it is not an Executor RawToolResult.
+            raw_result_ref=None,
+        )
+        evidence.append(record.model_dump(mode="json"))
+    return evidence
+
+
+async def planner(state: PlanExecuteState) -> dict[str, Any]:
+    """Generate bounded knowledge, hypotheses and hypothesis-bound steps."""
+    diagnosis_id = state.get("diagnosis_id", "unknown")
+    logger.info("diagnosis_id={} planner started", diagnosis_id)
+    input_text = str(state.get("input", "")).strip()
+    diagnosis_request, _ = _truncate(input_text, MAX_DIAGNOSIS_REQUEST_CHARS)
+
+    knowledge = await _retrieve_bounded_knowledge(input_text)
+    available_tools, discovery_error = await load_available_tools()
+    if discovery_error:
+        logger.warning("MCP 工具发现失败，使用本地工具继续: {}", discovery_error)
+
+    tool_names = {
+        str(getattr(tool, "name", "")) for tool in available_tools if getattr(tool, "name", None)
+    }
+    tools_description = format_tools_description(
+        available_tools,
+        max_chars=config.aiops_tool_schema_max_chars,
+    )
+
+    try:
         llm = ChatQwen(
             model=config.rag_model,
-            api_key=config.dashscope_api_key,
-            temperature=0
+            api_key=SecretStr(config.dashscope_api_key),
+            base_url=config.dashscope_api_base,
+            temperature=0,
         )
+        chain = PLANNER_PROMPT | llm.with_structured_output(DiagnosisPlan)
+        result = await asyncio.wait_for(
+            chain.ainvoke(
+                {
+                    "diagnosis_request": diagnosis_request or "诊断当前系统异常",
+                    "tools_description": tools_description,
+                    "knowledge_context": _render_knowledge_context(knowledge),
+                }
+            ),
+            timeout=config.aiops_tool_timeout_seconds,
+        )
+        diagnosis_plan = _validate_and_bound_plan(result, tool_names)
+    except Exception as exc:
+        logger.error(
+            "Planner Structured Output 失败，使用结构化 fallback: {}: {}",
+            type(exc).__name__,
+            exc,
+        )
+        diagnosis_plan = _fallback_plan(tool_names)
 
-        planner_chain = planner_prompt | llm.with_structured_output(Plan)
+    plan_payload = diagnosis_plan.model_dump(mode="json")
+    hypothesis_ids = [item["id"] for item in plan_payload["hypotheses"]]
+    evidence = _knowledge_evidence(knowledge, hypothesis_ids)
 
-        # 调用 LLM 生成计划
-        plan_result = await planner_chain.ainvoke({
-            "messages": [("user", input_text)],
-            "tools_description": tools_description,
-            "experience_context": experience_context
-        })
-
-        # 提取步骤列表
-        if isinstance(plan_result, Plan):
-            plan_steps = plan_result.steps
-        else:
-            # 如果返回的是字典，提取 steps 字段
-            plan_steps = plan_result.get("steps", [])  # type: ignore
-
-        logger.info(f"计划已生成，共 {len(plan_steps)} 个步骤")
-        for i, step in enumerate(plan_steps, 1):
-            logger.info(f"  步骤{i}: {step}")
-
-        return {"plan": plan_steps}
-
-    except Exception as e:
-        logger.error(f"生成计划失败: {e}", exc_info=True)
-        # 返回一个默认计划
-        return {
-            "plan": [
-                "收集相关信息",
-                "分析数据",
-                "生成报告"
-            ]
-        }
+    logger.info(
+        "diagnosis_id={} planner completed hypotheses={} steps={} knowledge={} "
+        "knowledge_evidence={}",
+        diagnosis_id,
+        len(plan_payload["hypotheses"]),
+        len(plan_payload["steps"]),
+        len(knowledge),
+        len(evidence),
+    )
+    return {
+        "retrieved_knowledge": knowledge,
+        "evidence": evidence,
+        "hypotheses": plan_payload["hypotheses"],
+        "plan": plan_payload["steps"],
+    }
