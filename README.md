@@ -1,4 +1,4 @@
-# SuperBizAgent
+# OpsPilot
 
 > 基于 FastAPI、LangChain/LangGraph、通义千问、Milvus 与 MCP 的智能
 > OnCall 助手，提供多轮对话、RAG 知识库问答、Prometheus 告警查询和
@@ -12,7 +12,7 @@
 
 ## 项目简介
 
-SuperBizAgent 是一个面向运维和企业知识场景的全栈 Agent 示例项目。它将
+OpsPilot 是一个面向运维和企业知识场景的全栈 Agent 示例项目。它将
 对话模型、知识库检索、监控告警、日志/指标工具和自动诊断工作流组合在一个
 Web 应用中：
 
@@ -211,8 +211,8 @@ curl -N -X POST "http://localhost:9900/api/aiops" \
 ### 1. 获取代码
 
 ```bash
-git clone https://github.com/hanghopetofly-coder/OnCall-agent.git
-cd OnCall-agent
+git clone https://github.com/hanghopetofly-coder/OpsPilot.git
+cd OpsPilot
 ```
 
 ### 2. 安装依赖
@@ -249,7 +249,7 @@ pip install -e .
 
 ```dotenv
 # 应用
-APP_NAME=SuperBizAgent
+APP_NAME=OpsPilot
 APP_VERSION=1.2.1
 DEBUG=false
 HOST=0.0.0.0
@@ -416,7 +416,7 @@ Pydantic Settings 会读取根目录 `.env`，变量名大小写不敏感。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `APP_NAME` | `SuperBizAgent` | 应用名称 |
+| `APP_NAME` | `OpsPilot` | 应用名称 |
 | `APP_VERSION` | `1.0.0` | API 展示版本 |
 | `DEBUG` | `false` | 调试模式和日志级别 |
 | `HOST` | `0.0.0.0` | 监听地址 |
@@ -659,7 +659,7 @@ CLS、Prometheus、Grafana、云监控或内部可观测平台 API。
 ## 项目结构
 
 ```text
-OnCall-agent/
+OpsPilot/
 ├── app/
 │   ├── agent/
 │   │   ├── aiops/
